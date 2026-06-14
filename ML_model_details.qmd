@@ -1,0 +1,492 @@
+---
+title: "ML model"
+author: "Xuan Hieu Nguyen"
+format: html
+editor: visual
+---
+
+```{r seed setup, eval=TRUE}
+cur_seed <- Sys.time() |> as.integer()
+#cur_seed <- 1779359474
+cur_seed <- readLines("R_objects/seed4.txt") |> as.integer()
+set.seed(cur_seed)
+keras3::set_random_seed(cur_seed)
+#writeLines(cur_seed |> as.character(), "R_objects/seed.txt")
+```
+
+# Data
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(tidymodels)
+
+columns_to_remove <- c(
+  "subject_id", "hadm_id", "icustay_id", "DIAGNOSIS", "ICD9_diagnosis", "DOB",
+  "ADMITTIME", "Diff"
+)
+
+train_X <- read_csv("train_X.csv")
+train_y <- read_csv("train_y.csv")
+test_X <- read_csv("test_X.csv")
+MIMIC_metadata_diagnose <- read_csv("MIMIC_metadata_diagnose.csv")
+MIMIC_diagnoses <- read_csv("MIMIC_diagnoses.csv") |> janitor::clean_names()
+
+combined_XY <- left_join(train_X, train_y) |>
+  left_join(MIMIC_diagnoses) |>
+  select(-seq_num) |>
+  mutate(from_data = 1)
+
+test_X <- test_X |>
+  left_join(MIMIC_diagnoses) |>
+  select(-seq_num) |>
+  mutate(HOSPITAL_EXPIRE_FLAG = NA, from_data = 2)
+
+merged_for_multi_hot_encode <- rbind(combined_XY, test_X)
+
+# all_ICD9_codes <- c(
+#   combined_XY$icd9_code,
+#   combined_XY$ICD9_diagnosis,
+#   test_X$icd9_code,
+#   test_X$ICD9_diagnosis
+#   #MIMIC_diagnoses$icd9_code
+#   #MIMIC_metadata_diagnose$ICD9_CODE
+# ) |> unique()
+# 
+# combined_XY <- combined_XY |>
+#   mutate(icd9_code = factor(icd9_code, levels = all_ICD9_codes))
+# 
+# test_X <- test_X |>
+#   mutate(icd9_code = factor(icd9_code, levels = all_ICD9_codes))
+```
+
+```{r, message=FALSE, warning=FALSE}
+multi_hot_encode <- function(df) df |>
+  mutate(value = 1) |>
+  pivot_wider(
+    names_from = icd9_code,
+    values_from = value,
+    values_fill = 0,
+    values_fn = max,
+    names_prefix = "ICD9_code_"
+  )
+
+one_hot_encode <- function(df) {
+  # Identify numeric and categorical columns
+  num_cols <- sapply(df, is.numeric)
+  cat_cols <- !num_cols
+  
+  # Convert categorical columns to factors
+  df[cat_cols] <- lapply(df[cat_cols], as.factor)
+  
+  # One-hot encode categorical columns only
+  dummy_matrix <- model.matrix(~ . - 1, data = df[cat_cols])
+  
+  # Combine untouched numeric columns with encoded columns
+  final_df <- cbind(df[num_cols], as.data.frame(dummy_matrix))
+  final_df
+}
+
+system.time({
+  encoded_data <- merged_for_multi_hot_encode |>
+    multi_hot_encode() |>
+    select(-columns_to_remove) |>
+    one_hot_encode()
+  
+  combined_XY <- encoded_data |>
+    filter(from_data == 1) |>
+    select(-from_data)
+  
+  test_X <- encoded_data |>
+    filter(from_data == 2) |>
+    select(-c(from_data, HOSPITAL_EXPIRE_FLAG))
+})
+rm(encoded_data)
+```
+
+```{r}
+train_test_split <- rsample::initial_split(combined_XY, 0.8, strata = HOSPITAL_EXPIRE_FLAG)
+train_data <- rsample::training(train_test_split)
+test_data <- rsample::testing(train_test_split)
+```
+
+```{r}
+save_runtime <- function(runtime, model_name,
+                         file = "R_objects/runtime_results.csv") {
+  runtime_df <- tibble(
+    model = model_name,
+    user = as.numeric(runtime["user.self"]),
+    system = as.numeric(runtime["sys.self"]),
+    elapsed = as.numeric(runtime["elapsed"])
+  )
+
+  write.table(
+    runtime_df,
+    file = file,
+    sep = ",",
+    row.names = FALSE,
+    col.names = !file.exists(file),
+    append = file.exists(file)
+  )
+}
+```
+
+# Logistic regression
+
+```{r, eval=FALSE}
+log_model <- logistic_reg() |>
+  set_engine("glm") |>
+  set_mode("classification")
+system.time({
+  log_fit <- fit(
+    log_model,
+    HOSPITAL_EXPIRE_FLAG ~ .,
+    train_data |> mutate(HOSPITAL_EXPIRE_FLAG = as.factor(HOSPITAL_EXPIRE_FLAG))
+  )
+}) |>
+  save_runtime("logistic_reg")
+saveRDS(log_fit, "R_objects/log_fit.rds")
+```
+
+```{r, eval=TRUE}
+log_fit <- readRDS("R_objects/log_fit.rds")
+```
+
+```{r, eval=FALSE}
+train_res <- bind_cols(
+  train_data |> select(HOSPITAL_EXPIRE_FLAG),
+  predict(log_fit, train_data),
+  predict(log_fit, train_data, type = "prob")
+) |>
+  mutate(HOSPITAL_EXPIRE_FLAG = as.factor(HOSPITAL_EXPIRE_FLAG))
+
+CM_train <- table(
+  Actual = train_res$HOSPITAL_EXPIRE_FLAG,
+  Predicted = train_res$.pred_class
+)
+CM_train
+
+paste0(
+  "Balanced accuracy (train): ",
+  mean(c(
+    CM_train[1,1] / sum(CM_train[1,]),
+    CM_train[2,2] / sum(CM_train[2,])
+  )) |> round(3)
+)
+
+roc_auc(train_res, HOSPITAL_EXPIRE_FLAG, .pred_0)
+roc_curve(train_res, HOSPITAL_EXPIRE_FLAG, .pred_0) |> autoplot()
+
+test_res <- bind_cols(
+  test_data |> select(HOSPITAL_EXPIRE_FLAG),
+  predict(log_fit, test_data),
+  predict(log_fit, test_data, type = "prob")
+) |>
+  mutate(HOSPITAL_EXPIRE_FLAG = as.factor(HOSPITAL_EXPIRE_FLAG))
+
+CM_test <- table(
+  Actual = test_res$HOSPITAL_EXPIRE_FLAG,
+  Predicted = test_res$.pred_class
+)
+CM_test
+
+paste0(
+  "Balanced accuracy (test): ",
+  mean(c(
+    CM_test[1,1] / sum(CM_test[1,]),
+    CM_test[2,2] / sum(CM_test[2,])
+  )) |> round(3)
+)
+
+roc_auc(test_res, HOSPITAL_EXPIRE_FLAG, .pred_0)
+roc_curve(test_res, HOSPITAL_EXPIRE_FLAG, .pred_0) |> autoplot()
+```
+
+# KNN
+
+```{r, eval=FALSE}
+knn_test_model <- nearest_neighbor(
+  neighbors = 5, weight_func = "rectangular", dist_power = 2
+) |>
+  set_engine("kknn") |>
+  set_mode("classification")
+system.time({
+  knn_fit <- fit(
+    knn_test_model,
+    HOSPITAL_EXPIRE_FLAG ~ .,
+    train_data |> mutate(HOSPITAL_EXPIRE_FLAG = as.factor(HOSPITAL_EXPIRE_FLAG))
+  )
+}) |>
+  save_runtime("KNN")
+saveRDS(knn_fit, "R_objects/KNN_fit.rds")
+```
+
+```{r, eval=FALSE}
+knn_fit <- readRDS("R_objects/KNN_fit.rds")
+```
+
+```{r, eval=FALSE}
+train_res <- bind_cols(
+  train_data |> select(HOSPITAL_EXPIRE_FLAG),
+  predict(knn_fit, train_data),
+  predict(knn_fit, train_data, type = "prob")
+) |>
+  mutate(HOSPITAL_EXPIRE_FLAG = as.factor(HOSPITAL_EXPIRE_FLAG))
+
+CM_train <- table(
+  Actual = train_res$HOSPITAL_EXPIRE_FLAG,
+  Predicted = train_res$.pred_class
+)
+CM_train
+
+paste0(
+  "Balanced accuracy (train): ",
+  mean(c(
+    CM_train[1,1] / sum(CM_train[1,]),
+    CM_train[2,2] / sum(CM_train[2,])
+  )) |> round(3)
+)
+
+roc_auc(train_res, HOSPITAL_EXPIRE_FLAG, .pred_0)
+roc_curve(train_res, HOSPITAL_EXPIRE_FLAG, .pred_0) |> autoplot()
+
+test_res <- bind_cols(
+  test_data |> select(HOSPITAL_EXPIRE_FLAG),
+  predict(knn_fit, test_data),
+  predict(knn_fit, test_data, type = "prob")
+) |>
+  mutate(HOSPITAL_EXPIRE_FLAG = as.factor(HOSPITAL_EXPIRE_FLAG))
+
+CM_test <- table(
+  Actual = test_res$HOSPITAL_EXPIRE_FLAG,
+  Predicted = test_res$.pred_class
+)
+CM_test
+
+paste0(
+  "Balanced accuracy (test): ",
+  mean(c(
+    CM_test[1,1] / sum(CM_test[1,]),
+    CM_test[2,2] / sum(CM_test[2,])
+  )) |> round(3)
+)
+
+roc_auc(test_res, HOSPITAL_EXPIRE_FLAG, .pred_0)
+roc_curve(test_res, HOSPITAL_EXPIRE_FLAG, .pred_0) |> autoplot()
+```
+
+# Decision tree
+
+```{r, eval=FALSE}
+tree_model <- decision_tree(
+  min_n = 200, tree_depth = 6, cost_complexity = 0.001
+) |>
+  set_engine("rpart") |>
+  set_mode("classification")
+{tree_fit <- fit(
+  tree_model,
+  HOSPITAL_EXPIRE_FLAG ~ .,
+  train_data |> mutate(HOSPITAL_EXPIRE_FLAG = as.factor(HOSPITAL_EXPIRE_FLAG))
+)} |>
+  system.time() |>
+  save_runtime("tree fit")
+saveRDS(tree_fit, "R_objects/tree_fit.rds")
+```
+
+```{r}
+tree_fit <- readRDS("R_objects/tree_fit.rds")
+```
+
+```{r}
+train_res <- bind_cols(
+  train_data |> select(HOSPITAL_EXPIRE_FLAG),
+  predict(tree_fit, train_data),
+  predict(tree_fit, train_data, type = "prob")
+) |>
+  mutate(HOSPITAL_EXPIRE_FLAG = as.factor(HOSPITAL_EXPIRE_FLAG))
+
+CM_train <- table(
+  Actual = train_res$HOSPITAL_EXPIRE_FLAG,
+  Predicted = train_res$.pred_class
+)
+CM_train
+
+paste0(
+  "Balanced accuracy (train): ",
+  mean(c(
+    CM_train[1,1] / sum(CM_train[1,]),
+    CM_train[2,2] / sum(CM_train[2,])
+  )) |> round(3)
+)
+
+roc_auc(train_res, HOSPITAL_EXPIRE_FLAG, .pred_0)
+roc_curve(train_res, HOSPITAL_EXPIRE_FLAG, .pred_0) |> autoplot()
+
+test_res <- bind_cols(
+  test_data |> select(HOSPITAL_EXPIRE_FLAG),
+  predict(tree_fit, test_data),
+  predict(tree_fit, test_data, type = "prob")
+) |>
+  mutate(HOSPITAL_EXPIRE_FLAG = as.factor(HOSPITAL_EXPIRE_FLAG))
+
+CM_test <- table(
+  Actual = test_res$HOSPITAL_EXPIRE_FLAG,
+  Predicted = test_res$.pred_class
+)
+CM_test
+
+paste0(
+  "Balanced accuracy (test): ",
+  mean(c(
+    CM_test[1,1] / sum(CM_test[1,]),
+    CM_test[2,2] / sum(CM_test[2,])
+  )) |> round(3)
+)
+
+roc_auc(test_res, HOSPITAL_EXPIRE_FLAG, .pred_0)
+roc_curve(test_res, HOSPITAL_EXPIRE_FLAG, .pred_0) |> autoplot()
+```
+
+# NN_model
+
+```{r}
+library(keras3)
+```
+
+```{r}
+NN_model <- keras_model_sequential()
+NN_model |>
+  layer_dense(units = 1000, activation = "relu", input_shape = ncol(train_data) - 1) |>
+  # layer_dense(units = 5000, activation = "relu") |>
+  # layer_dense(units = 2500, activation = "relu") |>
+  # layer_dense(units = 1250, activation = "relu") |>
+  # layer_dense(units = 625, activation = "relu") |>
+  # layer_dense(units = 313, activation = "relu") |>
+  # layer_dense(units = 79, activation = "relu") |>
+  layer_dense(units = 400, activation = "relu") |>
+  layer_dense(units = 20, activation = "relu") |>
+  layer_dense(units = 1, activation = "sigmoid")
+```
+
+```{r}
+NN_model |> compile(
+  optimizer = "adam",
+  loss = loss_binary_focal_crossentropy(),
+  metrics = list(metric_auc())
+)
+
+NN_train_X <- train_data |>
+  select(-HOSPITAL_EXPIRE_FLAG) |>
+  as.matrix()
+NN_train_y <- train_data$HOSPITAL_EXPIRE_FLAG
+
+NN_test_X <- test_data |>
+  select(-HOSPITAL_EXPIRE_FLAG) |>
+  as.matrix()
+NN_test_y <- test_data$HOSPITAL_EXPIRE_FLAG
+```
+
+```{r}
+early_stop <- callback_early_stopping(
+  monitor = "val_auc",
+  mode = "max",
+  patience = 10,
+  restore_best_weights = TRUE
+)
+
+{NN_fit <- NN_model |> 
+  keras3::fit(
+    x = NN_train_X, 
+    y = NN_train_y,
+    validation_data = list(
+      NN_test_X,
+      NN_test_y
+    ),
+    epochs = 50,
+    batch_size = 32, # default
+    verbose = 1,
+    callbacks = list(early_stop)
+  )} |>
+  system.time() |>
+  save_runtime("neural network")
+keras3::save_model(NN_model, "R_objects/NN_model.keras")
+saveRDS(NN_fit, "R_objects/NN_fit_history.rds")
+plot(NN_fit)
+```
+
+```{r, eval=FALSE}
+NN_model <- keras3::load_model("R_objects/NN_model.keras")
+```
+
+```{r}
+summary(NN_model)
+```
+
+```{r}
+train_res <- train_data |>
+  mutate(
+    HOSPITAL_EXPIRE_FLAG = as.factor(HOSPITAL_EXPIRE_FLAG),
+    pred_prob = 1 - predict(
+      NN_model,
+      NN_train_X
+    )[,1],
+    pred_class = round(1 - pred_prob) |> factor(levels = c(0, 1))
+  ) |>
+  select(HOSPITAL_EXPIRE_FLAG, pred_prob, pred_class)
+
+CM_train <- table(
+  Actual = train_res$HOSPITAL_EXPIRE_FLAG,
+  Predicted = train_res$pred_class
+)
+CM_train
+
+paste0(
+  "Balanced accuracy (train): ",
+  mean(c(
+    CM_train[1,1] / sum(CM_train[1,]),
+    CM_train[2,2] / sum(CM_train[2,])
+  )) |> round(3)
+)
+
+roc_auc(train_res, HOSPITAL_EXPIRE_FLAG, pred_prob)
+roc_curve(train_res, HOSPITAL_EXPIRE_FLAG, pred_prob) |> autoplot()
+
+test_res <- test_data |>
+  mutate(
+    HOSPITAL_EXPIRE_FLAG = as.factor(HOSPITAL_EXPIRE_FLAG),
+    pred_prob = 1 - predict(
+      NN_model,
+      NN_test_X
+    )[,1],
+    pred_class = round(1 - pred_prob) |> factor(levels = c(0, 1))
+  ) |>
+  select(HOSPITAL_EXPIRE_FLAG, pred_prob, pred_class)
+
+CM_test <- table(
+  Actual = test_res$HOSPITAL_EXPIRE_FLAG,
+  Predicted = test_res$pred_class
+)
+CM_test
+
+paste0(
+  "Balanced accuracy (test): ",
+  mean(c(
+    CM_test[1,1] / sum(CM_test[1,]),
+    CM_test[2,2] / sum(CM_test[2,])
+  )) |> round(3)
+)
+
+roc_auc(test_res, HOSPITAL_EXPIRE_FLAG, pred_prob)
+roc_curve(test_res, HOSPITAL_EXPIRE_FLAG, pred_prob) |> autoplot()
+```
+
+```{r, eval=FALSE}
+test_y <- predict(
+  NN_model,
+  test_X |>
+    as.matrix()
+)
+test_y <- read_csv("test_X.csv") |>
+  select(icustay_id) |>
+  mutate(HOSPITAL_EXPIRE_FLAG = test_y[,1])
+write_csv(test_y, "test_y/test_y.csv")
+```
